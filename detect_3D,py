@@ -1,0 +1,212 @@
+# Code to perform live 3D object tracking using YOLOv5 and MiDaS
+# This code can be easily run on VsCode
+# Requirements: yolov5, transformers, opencv-python, torch, numpy, matplotlib, Pillow
+# Import necessary libraries
+# How to run: python detect_3D.py 
+
+import cv2
+import torch
+import numpy as np
+import json
+import argparse
+from pathlib import Path
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from PIL import Image
+from models.common import DetectMultiBackend
+from utils.dataloaders import LoadImages, LoadStreams
+from utils.general import check_img_size, non_max_suppression, increment_path
+from utils.torch_utils import select_device
+
+
+class DepthAnythingV2Estimator:
+    def __init__(self, model_size='small'):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model_configs = {
+            'small': 'depth-anything/Depth-Anything-V2-Small-hf',
+            'base': 'depth-anything/Depth-Anything-V2-Base-hf',
+            'large': 'depth-anything/Depth-Anything-V2-Large-hf'
+        }
+        try:
+            from transformers import pipeline
+            model_name = self.model_configs.get(model_size)
+            print(f"Loading Depth Anything V2 model: {model_size}")
+            self.pipe = pipeline(
+                task="depth-estimation",
+                model=model_name,
+                device=0 if torch.cuda.is_available() else -1
+            )
+        except Exception as e:
+            print(f"Failed to load Depth Anything V2: {e}")
+            self.pipe = None
+
+    def preprocess_image(self, image):
+        if isinstance(image, np.ndarray):
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            image = Image.fromarray(image)
+        return image
+
+    def estimate_depth(self, frame, bbox=None):
+        if self.pipe is not None:
+            try:
+                image = self.preprocess_image(frame)
+                result = self.pipe(image)
+                depth_map = np.array(result['depth'])
+                depth_map = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min()) * 255
+                if bbox:
+                    x1, y1, x2, y2 = map(int, bbox)
+                    h, w = depth_map.shape
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(w, x2), min(h, y2)
+                    roi = depth_map[y1:y2, x1:x2]
+                    if roi.size > 0:
+                        return float(np.median(roi))
+                return 100.0
+            except:
+                return 100.0
+        return 100.0
+
+
+class KalmanFilter3D:
+    def __init__(self, x, y, z, dt=1.0, g=0.5):
+        self.dt = dt
+        self.g = g
+        self.state = np.array([x, y, z, 0, 0, 0], dtype=np.float32)
+        self.F = np.array([
+            [1, 0, 0, dt, 0, 0],
+            [0, 1, 0, 0, dt, 0],
+            [0, 0, 1, 0, 0, dt],
+            [0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 1]
+        ], dtype=np.float32)
+        self.H = np.eye(3, 6, dtype=np.float32)
+        self.Q = np.eye(6, dtype=np.float32) * 0.01
+        self.R = np.diag([10, 10, 50]).astype(np.float32)
+        self.P = np.eye(6, dtype=np.float32) * 100
+
+    def predict(self):
+        self.state = self.F @ self.state
+        self.state[1] += 0.5 * self.g * self.dt ** 2
+        self.state[4] += self.g * self.dt
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        return self.state[0], self.state[1], self.state[2]
+
+    def correct(self, x, y, z):
+        z_meas = np.array([x, y, z], dtype=np.float32)
+        y_res = z_meas - self.H @ self.state
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.state += K @ y_res
+        I = np.eye(6)
+        self.P = (I - K @ self.H) @ self.P
+
+
+def run():
+    weights = 'yolov5s.pt'
+    source = '0'
+    data = 'data/coco128.yaml'
+    imgsz = 640
+    conf_thres = 0.3
+    iou_thres = 0.45
+    max_det = 1000
+    device = ''
+    project = 'runs/detect'
+    name = 'live'
+    exist_ok = True
+    half = False
+    dnn = False
+    g = 0.5
+    early_pred_frame = 10
+
+    save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    device = select_device(device)
+    model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
+    stride = model.stride
+    imgsz = check_img_size(imgsz, s=stride)
+    depth_estimator = DepthAnythingV2Estimator('small')
+
+    dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=model.pt)
+    kf = None
+    actual_traj = []
+    pred_traj = []
+    frame_idx = 0
+    triggered = False
+    frame_height = None
+
+    for path, im, im0s, _, _ in dataset:
+        if frame_height is None:
+            frame_height = im0s.shape[0]
+
+        im = torch.from_numpy(im).to(device)
+        im = im.half() if half else im.float()
+        im /= 255
+        if len(im.shape) == 3:
+            im = im[None]
+
+        pred = model(im)
+        pred = non_max_suppression(pred, conf_thres, iou_thres, None, False, max_det=max_det)[0]
+        current_3d = None
+
+        if pred is not None and len(pred):
+            pred[:, :4] = pred[:, :4].round()
+            *xyxy, conf, cls = pred[0]
+            cx = int((xyxy[0] + xyxy[2]) / 2)
+            cy = int((xyxy[1] + xyxy[3]) / 2)
+            bbox = (int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3]))
+            cz = depth_estimator.estimate_depth(im0s, bbox)
+
+            if kf is None:
+                kf = KalmanFilter3D(cx, cy, cz, g=g)
+            else:
+                kf.predict()
+                kf.correct(cx, cy, cz)
+
+            state = kf.state
+            current_3d = (int(state[0]), int(state[1]), state[2])
+        elif kf is not None:
+            px, py, pz = kf.predict()
+            current_3d = (int(px), int(py), pz)
+
+        actual_traj.append(current_3d if current_3d else None)
+
+        if frame_idx == early_pred_frame and kf is not None and not triggered:
+            triggered = True
+            x0, y0, z0, vx0, vy0, vz0 = kf.state
+            for t in range(100):
+                x = x0 + vx0 * t
+                y = y0 + vy0 * t + 0.5 * g * t ** 2
+                z = z0 + vz0 * t
+                if y >= frame_height - 5:
+                    break
+                pred_traj.append((int(x), int(y), z))
+
+        # Draw current detection
+        if current_3d:
+            cv2.circle(im0s, (current_3d[0], current_3d[1]), 5, (0, 255, 0), -1)
+
+        # Draw predicted trajectory
+        for pt in pred_traj:
+            cv2.circle(im0s, (pt[0], int(pt[1])), 3, (0, 0, 255), -1)
+
+        cv2.imshow('Live 3D Tracking', im0s)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+        frame_idx += 1
+
+    cv2.destroyAllWindows()
+    with open(save_dir / 'trajectory_live_3d.json', 'w') as f:
+        json.dump({
+            'actual': actual_traj,
+            'predicted': pred_traj,
+            'trigger_frame': early_pred_frame,
+            'frame_height': frame_height
+        }, f)
+    print(f"Results saved to {save_dir}")
+
+
+if __name__ == "__main__":
+    run()
+
